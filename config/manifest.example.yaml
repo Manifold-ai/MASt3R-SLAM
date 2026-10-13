@@ -1,0 +1,33 @@
+# Example manifest for the novel-pos single-shot pipeline (ADR-001).
+# Run: python run_novel_pos.py --manifest config/manifest.example.yaml
+# Paths are resolved relative to THIS file's directory unless absolute.
+
+gs_ply: scene.ply                      # existing Gaussian Splatting (.ply, 3DGS / SH0+)
+
+panorama:                              # v1: metadata only (not consumed by the update)
+  image: pano.png
+  pose:                                # panorama camera center == GS world origin
+    translation: [0.0, 0.0, 0.0]
+    quaternion_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+novel_view:
+  reference_intrinsics:                # v1: PARSED but NOT used (use_calib forced off)
+    width: 512
+    height: 512
+    fx: 256.0
+    fy: 256.0
+    cx: 256.0
+    cy: 256.0
+  render_image: nv_render.png          # novel-view original (rendered from GS)
+  completion_image: nv_ai.png          # novel-view AI completion
+  pose:                                # REQUIRED: render / operating pose (world <- camera)
+    translation: [0.0, 0.0, 0.0]
+    quaternion_xyzw: [0.0, 0.0, 0.0, 1.0]
+    scale: 1.0
+
+output_ply: updated.ply                # merged output (degraded GS + new completion points)
+
+gs_degrade:
+  opacity_threshold: 0.5               # post-sigmoid alpha threshold for degradation
+confidence:
+  update_conf_percentile: 50           # keep completion points with conf above this percentile
