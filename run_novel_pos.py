@@ -12,10 +12,7 @@ Requires a CUDA GPU and the compiled `mast3r_slam_backends` extension: the pipel
 submodules transitively import it, so we fail fast here if CUDA is unavailable.
 """
 import argparse
-import os
 import sys
-
-os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")  # enable EXR before any cv2 import
 
 import torch
 

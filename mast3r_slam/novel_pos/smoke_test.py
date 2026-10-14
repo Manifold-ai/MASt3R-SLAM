@@ -1,4 +1,4 @@
-"""Backend-free smoke test for the novel-pos pure modules (ADR-001 修订2).
+"""Backend-free smoke test for the novel-pos pure modules (ADR-001 修订3).
 
 Runs WITHOUT a GPU, the MASt3R model, or the compiled CUDA backend. Needs only numpy
 (+ plyfile for the gs_io round-trip; + torch & lietorch for the pose section, which is
@@ -11,7 +11,7 @@ import tempfile
 
 import numpy as np
 
-from mast3r_slam.novel_pos import gs_io, align, render_io
+from mast3r_slam.novel_pos import gs_io, align, gs_project
 
 
 # ----------------------------------------------------------------------------- gs_io
@@ -53,10 +53,8 @@ def test_umeyama_rotation_scale_translation():
     s0, R0, t0 = 2.3, _random_rotation(rng), rng.randn(3)
     tgt = s0 * (src @ R0.T) + t0
     s, R, t, info = align.umeyama_with_reflection(src, tgt)
-    assert abs(s - s0) < 1e-6, (s, s0)
-    assert np.allclose(R, R0, atol=1e-6), R - R0
-    assert np.allclose(t, t0, atol=1e-5), (t, t0)
-    assert info["det_R"] > 0 and info["rms"] < 1e-6, info
+    assert abs(s - s0) < 1e-6 and np.allclose(R, R0, atol=1e-6), (s, info)
+    assert np.allclose(t, t0, atol=1e-5) and info["det_R"] > 0 and info["rms"] < 1e-6, info
     print("OK: umeyama rotation+scale+translation")
 
 
@@ -68,9 +66,8 @@ def test_umeyama_known_reflection():
     s0, t0 = 1.7, rng.randn(3)
     tgt = s0 * (src @ R0.T) + t0
     s, R, t, info = align.umeyama_with_reflection(src, tgt)
-    assert np.allclose(R, R0, atol=1e-6), R - R0          # SO(3)-forced solver would FAIL here
-    assert info["det_R"] < 0, info["det_R"]
-    assert abs(s - s0) < 1e-6 and info["rms"] < 1e-6, info
+    assert np.allclose(R, R0, atol=1e-6), R - R0          # SO(3)-forced solver would FAIL
+    assert info["det_R"] < 0 and abs(s - s0) < 1e-6 and info["rms"] < 1e-6, info
     print("OK: umeyama recovers a known reflection")
 
 
@@ -87,28 +84,35 @@ def test_umeyama_guards():
     print("OK: umeyama guards (N<3, degenerate source)")
 
 
-# ---------------------------------------------------------------------- gather map
+# ------------------------------------------------------------------------- gs_project
 
-def test_gather_mapping():
-    H0, W0 = 8, 12
-    arr = (np.arange(H0)[:, None] * 100 + np.arange(W0)[None, :]).astype(np.float32)[..., None]
-    transform = (2.0, 2.0, 1.0, 0.5)                      # (scale_w, scale_h, hcw, hch)
-    true_shape = (3, 4)
-    got = render_io.gather_to_grid(arr, true_shape, transform)
-    assert got.shape == (12, 1), got.shape
-    sw, sh, hcw, hch = transform
-    exp = np.empty((3, 4, 1), np.float32)
-    for v in range(3):
-        for u in range(4):
-            uo = min(int(round((u + hcw) * sw)), W0 - 1)
-            vo = min(int(round((v + hch) * sh)), H0 - 1)
-            exp[v, u, 0] = arr[vo, uo, 0]
-    assert np.array_equal(got, exp.reshape(12, 1)), (got.ravel(), exp.ravel())
+def test_quat_wxyz_to_matrix():
+    assert np.allclose(gs_project.quat_wxyz_to_matrix([1, 0, 0, 0]), np.eye(3))
+    c = np.cos(np.pi / 4)
+    R = gs_project.quat_wxyz_to_matrix([c, 0, 0, c])             # 90 deg about +z
+    assert np.allclose(R, [[0, -1, 0], [1, 0, 0], [0, 0, 1]], atol=1e-9), R
+    print("OK: quat_wxyz_to_matrix (identity + 90deg z)")
 
-    # identity: scale 1, no crop, grid == original -> flatten
-    ident = render_io.gather_to_grid(arr, (H0, W0), (1.0, 1.0, 0.0, 0.0))
-    assert np.array_equal(ident, arr.reshape(H0 * W0, 1))
-    print("OK: gather nearest mapping + identity")
+
+def test_project_gs_to_grid():
+    H, W = 100, 100
+    K = np.array([[100.0, 0, 50.0], [0, 100.0, 50.0], [0, 0, 1.0]])
+    R = np.eye(3)
+    t = np.zeros(3)
+    xyz = np.array([
+        [0.0, 0.0, 1.0],    # -> (50,50), Z=1 (nearest)
+        [0.0, 0.0, 2.0],    # -> (50,50), Z=2 (farther, must lose to the above)
+        [0.1, 0.0, 1.0],    # -> (60,50)
+        [0.0, 0.0, -1.0],   # behind camera -> dropped
+    ])
+    X, cov = gs_project.project_gs_to_grid(xyz, R, t, K, (H, W))
+    p_center = 50 * W + 50
+    p_right = 50 * W + 60
+    assert cov[p_center] and cov[p_right]
+    assert np.allclose(X[p_center], [0.0, 0.0, 1.0]), X[p_center]   # nearest wins (z-buffer)
+    assert np.allclose(X[p_right], [0.1, 0.0, 1.0]), X[p_right]
+    assert cov.sum() == 2 and np.isnan(X[0]).all()                 # behind-camera dropped
+    print("OK: project_gs_to_grid (pinhole + z-buffer + front culling)")
 
 
 # -------------------------------------------------------------------------- pose_utils
@@ -120,11 +124,8 @@ def test_pose_utils():
     except Exception as e:  # noqa: BLE001
         print(f"SKIP pose_utils (torch/lietorch unavailable: {e})")
         return
-    from mast3r_slam.novel_pos.manifest import PoseSpec
-    from mast3r_slam.novel_pos.pose_utils import sim3_from_pose_spec, decompose_relative_sim3
-
-    identity = PoseSpec(translation=[0.0, 0.0, 0.0], quaternion_xyzw=[0.0, 0.0, 0.0, 1.0])
-    rep = decompose_relative_sim3(sim3_from_pose_spec(identity, device="cpu"))
+    from mast3r_slam.novel_pos.pose_utils import decompose_relative_sim3
+    rep = decompose_relative_sim3(lietorch.Sim3.Identity(1, device="cpu"))
     assert abs(rep["rotation_deg"]) < 1e-4 and abs(rep["scale"] - 1.0) < 1e-6, rep
     assert rep["translation_norm"] < 1e-6, rep
     print("OK: pose_utils identity")
@@ -135,6 +136,7 @@ if __name__ == "__main__":
     test_umeyama_rotation_scale_translation()
     test_umeyama_known_reflection()
     test_umeyama_guards()
-    test_gather_mapping()
+    test_quat_wxyz_to_matrix()
+    test_project_gs_to_grid()
     test_pose_utils()
     print("smoke test done")

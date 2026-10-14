@@ -1,4 +1,4 @@
-# Example manifest for the novel-pos single-shot pipeline (ADR-001 修订2).
+# Example manifest for the novel-pos single-shot pipeline (ADR-001 修订3).
 # Run: python run_novel_pos.py --manifest config/manifest.example.yaml
 # Paths are resolved relative to THIS file's directory unless absolute.
 
@@ -6,18 +6,24 @@ gs_ply: scene.ply                        # existing Gaussian Splatting (.ply, 3D
 
 novel_view:
   render_image: nv_render.png            # REQUIRED: rendered-from-GS RGB (MASt3R mono input)
-  render_pointmap: nv_render_pos.npy     # REQUIRED: per-pixel GS-WORLD XYZ (renderer world-position pass);
-                                         #           (H0,W0,3) float32 as .npy, or an .exr position pass
-  render_coverage: nv_render_cov.npy     # REQUIRED: per-pixel valid mask; .npy(bool) or image(gray>127)
   completion_image: nv_ai.png            # REQUIRED: AI completion RGB
 
-  # OPTIONAL — sanity / report only; geometry comes from render_pointmap + the fitted transform C:
-  pose: {translation: [0.0, 0.0, 0.0], quaternion_xyzw: [0.0, 0.0, 0.0, 1.0], scale: 1.0}
-  reference_intrinsics: {width: 512, height: 512, fx: 256.0, fy: 256.0, cx: 256.0, cy: 256.0}
+  # REQUIRED — render camera, used to project the GS into the render view.
+  # CONVENTION (contract §2): pose is camera-to-world, quaternion WXYZ, OpenCV axes (z forward).
+  pose:
+    translation: [0.0, 0.0, 0.0]
+    quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]   # [w, x, y, z]
+  intrinsics:                               # pixel intrinsics for render_image ORIGINAL resolution
+    width: 1024
+    height: 1024
+    fx: 800.0
+    fy: 800.0
+    cx: 512.0
+    cy: 512.0
 
 panorama:                                # OPTIONAL — metadata only
   image: pano.png
-  pose: {translation: [0.0, 0.0, 0.0], quaternion_xyzw: [0.0, 0.0, 0.0, 1.0]}
+  pose: {translation: [0.0, 0.0, 0.0], quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]}
 
 output_ply: updated.ply                  # merged output (degraded GS + new completion points)
 

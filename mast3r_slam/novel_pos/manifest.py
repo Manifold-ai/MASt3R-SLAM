@@ -1,15 +1,13 @@
-"""Manifest schema + loader for the novel-pos pipeline (ADR-001 修订2).
+"""Manifest schema + loader for the novel-pos pipeline (ADR-001 修订3).
 
 Backend-free: stdlib + yaml only. Safe to import without a GPU or the compiled
 `mast3r_slam_backends` extension.
 
-The manifest describes the fixed inputs of a single-shot run:
-  - an existing Gaussian Splatting model (`.ply`),
-  - the novel-view render image (rendered-from-GS RGB), its GS-WORLD per-pixel pointmap
-    (renderer world-position pass) and a coverage mask, and the AI completion image,
-  - optionally the render pose and reference intrinsics (sanity only; geometry comes from
-    the render pointmap + the fitted similarity transform C),
-  - the output `.ply` path, plus degrade / confidence / validation-gate thresholds.
+The manifest describes a single-shot run: an existing GS (`.ply`); the novel-view render
+image + AI completion image; the render camera pose and intrinsics (used to project the GS
+into the render view); and the output `.ply`. CAMERA CONVENTION (contract §2): pose is
+camera-to-world, quaternion **wxyz**, OpenCV axes (z forward); intrinsics are pixel
+intrinsics for the render image's original resolution.
 """
 import dataclasses
 import pathlib
@@ -20,13 +18,12 @@ import yaml
 
 @dataclasses.dataclass
 class PoseSpec:
-    translation: List[float]       # (3,) world translation
-    quaternion_xyzw: List[float]   # (4,) rotation, xyzw order
-    scale: float = 1.0
+    translation: List[float]       # (3,) camera position in world
+    quaternion_wxyz: List[float]   # (4,) rotation, wxyz order; camera-to-world
 
 
 @dataclasses.dataclass
-class IntrinsicsSpec:               # parsed but unused in geometry (sanity only)
+class IntrinsicsSpec:               # pixel intrinsics for render_image original resolution
     width: int
     height: int
     fx: float
@@ -46,12 +43,10 @@ class GateThresholds:
 class Manifest:
     gs_ply: pathlib.Path
     render_image: pathlib.Path
-    render_pointmap: pathlib.Path       # GS-world per-pixel XYZ (.npy / .exr)
-    render_coverage: pathlib.Path       # per-pixel valid mask (.npy / image)
     completion_image: pathlib.Path
+    novel_pose: PoseSpec            # camera-to-world, wxyz, OpenCV; used for projection
+    intrinsics: IntrinsicsSpec      # used for projection (-> K_frame)
     output_ply: pathlib.Path
-    novel_pose: Optional[PoseSpec] = None            # sanity only
-    reference_intrinsics: Optional[IntrinsicsSpec] = None  # sanity only
     panorama_image: Optional[pathlib.Path] = None
     panorama_pose: Optional[PoseSpec] = None
     opacity_threshold: float = 0.5
@@ -67,15 +62,24 @@ def _req(d: dict, key: str, ctx: str):
 
 def _pose(d: dict, ctx: str) -> PoseSpec:
     t = _req(d, "translation", ctx)
-    q = _req(d, "quaternion_xyzw", ctx)
+    q = _req(d, "quaternion_wxyz", ctx)
     if len(t) != 3:
         raise ValueError(f"manifest: '{ctx}translation' must have 3 values, got {len(t)}")
     if len(q) != 4:
-        raise ValueError(f"manifest: '{ctx}quaternion_xyzw' must have 4 values (xyzw), got {len(q)}")
+        raise ValueError(f"manifest: '{ctx}quaternion_wxyz' must have 4 values (wxyz), got {len(q)}")
     return PoseSpec(
         translation=[float(x) for x in t],
-        quaternion_xyzw=[float(x) for x in q],
-        scale=float(d.get("scale", 1.0)),
+        quaternion_wxyz=[float(x) for x in q],
+    )
+
+
+def _intrinsics(d: dict, ctx: str) -> IntrinsicsSpec:
+    for k in ("width", "height", "fx", "fy", "cx", "cy"):
+        _req(d, k, ctx)
+    return IntrinsicsSpec(
+        width=int(d["width"]), height=int(d["height"]),
+        fx=float(d["fx"]), fy=float(d["fy"]),
+        cx=float(d["cx"]), cy=float(d["cy"]),
     )
 
 
@@ -97,22 +101,10 @@ def load_manifest(path: str) -> Manifest:
     gs_ply = _resolve(base, _req(d, "gs_ply", ""))
     nv = _req(d, "novel_view", "")
     render_image = _resolve(base, _req(nv, "render_image", "novel_view."))
-    render_pointmap = _resolve(base, _req(nv, "render_pointmap", "novel_view."))
-    render_coverage = _resolve(base, _req(nv, "render_coverage", "novel_view."))
     completion_image = _resolve(base, _req(nv, "completion_image", "novel_view."))
+    novel_pose = _pose(_req(nv, "pose", "novel_view."), "novel_view.pose.")
+    intrinsics = _intrinsics(_req(nv, "intrinsics", "novel_view."), "novel_view.intrinsics.")
     output_ply = _resolve(base, _req(d, "output_ply", ""))
-
-    # optional, sanity only
-    nvp = nv.get("pose")
-    novel_pose = _pose(nvp, "novel_view.pose.") if nvp else None
-    ri = nv.get("reference_intrinsics")
-    reference_intrinsics = None
-    if ri:
-        reference_intrinsics = IntrinsicsSpec(
-            width=int(ri["width"]), height=int(ri["height"]),
-            fx=float(ri["fx"]), fy=float(ri["fy"]),
-            cx=float(ri["cx"]), cy=float(ri["cy"]),
-        )
 
     pano = d.get("panorama") or {}
     panorama_image = _resolve(base, pano["image"]) if pano.get("image") else None
@@ -127,12 +119,9 @@ def load_manifest(path: str) -> Manifest:
         max_log_scale=float(g.get("max_log_scale", 0.1)),
     )
 
-    # required input files must exist (fail fast with resolved path)
     for label, p in [
         ("gs_ply", gs_ply),
         ("novel_view.render_image", render_image),
-        ("novel_view.render_pointmap", render_pointmap),
-        ("novel_view.render_coverage", render_coverage),
         ("novel_view.completion_image", completion_image),
     ]:
         if not p.exists():
@@ -143,12 +132,10 @@ def load_manifest(path: str) -> Manifest:
     return Manifest(
         gs_ply=gs_ply,
         render_image=render_image,
-        render_pointmap=render_pointmap,
-        render_coverage=render_coverage,
         completion_image=completion_image,
-        output_ply=output_ply,
         novel_pose=novel_pose,
-        reference_intrinsics=reference_intrinsics,
+        intrinsics=intrinsics,
+        output_ply=output_ply,
         panorama_image=panorama_image,
         panorama_pose=panorama_pose,
         opacity_threshold=opacity_threshold,
