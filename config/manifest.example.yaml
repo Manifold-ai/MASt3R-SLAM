@@ -1,33 +1,31 @@
-# Example manifest for the novel-pos single-shot pipeline (ADR-001).
+# Example manifest for the novel-pos single-shot pipeline (ADR-001 修订2).
 # Run: python run_novel_pos.py --manifest config/manifest.example.yaml
 # Paths are resolved relative to THIS file's directory unless absolute.
 
-gs_ply: scene.ply                      # existing Gaussian Splatting (.ply, 3DGS / SH0+)
-
-panorama:                              # v1: metadata only (not consumed by the update)
-  image: pano.png
-  pose:                                # panorama camera center == GS world origin
-    translation: [0.0, 0.0, 0.0]
-    quaternion_xyzw: [0.0, 0.0, 0.0, 1.0]
+gs_ply: scene.ply                        # existing Gaussian Splatting (.ply, 3DGS / SH0+)
 
 novel_view:
-  reference_intrinsics:                # v1: PARSED but NOT used (use_calib forced off)
-    width: 512
-    height: 512
-    fx: 256.0
-    fy: 256.0
-    cx: 256.0
-    cy: 256.0
-  render_image: nv_render.png          # novel-view original (rendered from GS)
-  completion_image: nv_ai.png          # novel-view AI completion
-  pose:                                # REQUIRED: render / operating pose (world <- camera)
-    translation: [0.0, 0.0, 0.0]
-    quaternion_xyzw: [0.0, 0.0, 0.0, 1.0]
-    scale: 1.0
+  render_image: nv_render.png            # REQUIRED: rendered-from-GS RGB (MASt3R mono input)
+  render_pointmap: nv_render_pos.npy     # REQUIRED: per-pixel GS-WORLD XYZ (renderer world-position pass);
+                                         #           (H0,W0,3) float32 as .npy, or an .exr position pass
+  render_coverage: nv_render_cov.npy     # REQUIRED: per-pixel valid mask; .npy(bool) or image(gray>127)
+  completion_image: nv_ai.png            # REQUIRED: AI completion RGB
 
-output_ply: updated.ply                # merged output (degraded GS + new completion points)
+  # OPTIONAL — sanity / report only; geometry comes from render_pointmap + the fitted transform C:
+  pose: {translation: [0.0, 0.0, 0.0], quaternion_xyzw: [0.0, 0.0, 0.0, 1.0], scale: 1.0}
+  reference_intrinsics: {width: 512, height: 512, fx: 256.0, fy: 256.0, cx: 256.0, cy: 256.0}
+
+panorama:                                # OPTIONAL — metadata only
+  image: pano.png
+  pose: {translation: [0.0, 0.0, 0.0], quaternion_xyzw: [0.0, 0.0, 0.0, 1.0]}
+
+output_ply: updated.ply                  # merged output (degraded GS + new completion points)
 
 gs_degrade:
-  opacity_threshold: 0.5               # post-sigmoid alpha threshold for degradation
+  opacity_threshold: 0.5                 # post-sigmoid alpha threshold for degradation
 confidence:
-  update_conf_percentile: 50           # keep completion points with conf above this percentile
+  update_conf_percentile: 50             # keep completion points with conf above this percentile
+validation_gate:                         # report-only render<->completion deviation thresholds
+  max_rotation_deg: 5.0
+  max_translation_norm: 0.1
+  max_log_scale: 0.1

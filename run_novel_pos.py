@@ -1,17 +1,21 @@
-"""Entry point for the novel-pos single-shot pipeline (ADR-001).
+"""Entry point for the novel-pos single-shot pipeline (ADR-001 修订2).
 
     python run_novel_pos.py --manifest manifest.yaml
 
-Reads a manifest (existing GS, panorama + pose, novel-view render/completion images and
-pose), degrades the GS to a point cloud, runs a pose-accuracy experiment on the AI
-completion image (report only), updates the point cloud via MASt3R inference, and writes
-a merged `.ply`.
+Reads a manifest (existing GS; novel-view render image + GS-world render pointmap +
+coverage + AI completion image; optional pose/intrinsics for sanity), degrades the GS to a
+point cloud, fits a similarity transform C from the render frame (render world pointmap vs
+MASt3R inference), applies C to the AI completion to place it in GS world, and writes a
+merged `.ply`. A report-only validation gate measures render<->completion deviation.
 
 Requires a CUDA GPU and the compiled `mast3r_slam_backends` extension: the pipeline
 submodules transitively import it, so we fail fast here if CUDA is unavailable.
 """
 import argparse
+import os
 import sys
+
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")  # enable EXR before any cv2 import
 
 import torch
 
@@ -26,6 +30,8 @@ def main():
     parser.add_argument("--config", default="config/base.yaml")
     parser.add_argument("--output", default=None, help="override manifest.output_ply")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--strict-gate", action="store_true",
+                        help="abort if the render<->completion validation gate exceeds tolerance")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -43,7 +49,8 @@ def main():
     # Lazy import: these pull in mast3r_slam_backends (the CUDA extension).
     from mast3r_slam.novel_pos.pipeline import run_pipeline
 
-    run_pipeline(args.manifest, device=args.device, output_override=args.output)
+    run_pipeline(args.manifest, device=args.device, output_override=args.output,
+                 strict_gate=args.strict_gate)
 
 
 if __name__ == "__main__":
