@@ -1,10 +1,11 @@
-"""Single-shot orchestration for the novel-pos pipeline (ADR-001 修订3).
+"""Single-shot orchestration for the novel-pos pipeline (ADR-001, asymmetric-only).
 
 Flow: load manifest -> degrade GS -> load model -> build render/completion frames (identity
-pose; MASt3R is pose-independent) -> mono-infer render -> PROJECT the degraded GS into the
-render view (pose+K, z-buffer) to get the GS-world pointmap X_r_GS + coverage -> fit
-similarity C (reflection allowed) X_r_GS ~= C.X_r_cam -> validation gate (report-only) ->
-apply C to the completion -> append -> write merged PLY.
+pose) -> ONE mast3r_match_asymmetric(render, completion) giving both pointmaps IN THE RENDER
+FRAME + the match -> project the GS into the render view (pose+K, z-buffer) -> fit similarity
+C (reflection allowed) X_r_GS ~= C.X_render -> residual validation gate (report-only) ->
+apply C to the completion pointmap -> select (conf percentile, or new_only via valid_match)
+-> append -> write merged PLY.
 
 WARNING: imports the CUDA backend (via the submodules below). GPU-only.
 """
@@ -13,7 +14,7 @@ import os
 import numpy as np
 import lietorch
 
-from mast3r_slam.mast3r_utils import load_mast3r, mast3r_inference_mono, resize_img
+from mast3r_slam.mast3r_utils import load_mast3r, mast3r_match_asymmetric, resize_img
 
 from mast3r_slam.novel_pos import align, gs_project
 from mast3r_slam.novel_pos.manifest import load_manifest
@@ -23,38 +24,28 @@ from mast3r_slam.novel_pos.gs_io import (
     write_ply,
 )
 from mast3r_slam.novel_pos.frames import load_rgb01, build_frame
-from mast3r_slam.novel_pos.pose_experiment import run_validation_gate
+from mast3r_slam.novel_pos.pose_experiment import residual_gate
 from mast3r_slam.novel_pos.pc_update import update_point_cloud
 
 MIN_FIT_PIXELS = 300  # floor on covered (projected) pixels used to fit C
 
 
-def _print_gate_report(dev: dict) -> None:
+def _print_gate_report(gate: dict) -> None:
     print("=" * 60)
-    print("Validation Gate (report only -- render<->completion content deviation)")
-    if not dev.get("ok"):
-        print(f"  FAILED: {dev.get('reason')}  (match_frac={dev.get('match_frac')})")
+    print("Validation Gate (report only -- render<->completion geometric residual)")
+    if not gate.get("ok"):
+        print(f"  FAILED: {gate.get('reason')}  (anchor frac={gate.get('frac_anchor')})")
     else:
-        flag = "OK" if dev["within_tolerance"] else "OUT OF TOLERANCE"
-        print(f"  [{flag}] matches used     : {dev['match_frac'] * 100:.1f}% of pixels")
-        print(f"  rotation deviation     : {dev['rotation_deg']:.3f} deg")
-        print(f"  translation deviation  : {dev['translation_norm']:.4f}")
-        print(f"  scale deviation        : {dev['scale']:.4f}")
+        flag = "OK" if gate["within_tolerance"] else "OUT OF TOLERANCE"
+        print(f"  [{flag}] anchor pixels : {gate['frac_anchor'] * 100:.1f}%")
+        print(f"  median residual      : {gate['median_residual']:.4g}")
+        print(f"  relative residual    : {gate['rel_residual']:.4g}")
     print("=" * 60)
 
 
-def _save_debug(debug_dir, render_frame, X_r_cam, X_r_GS, render_conf, cov, mask,
-                true_shape, s, R, t_c, info, gate):
-    """Dump the C-fit inputs/result for debugging (never raises -- debug must not break the run).
-
-    Writes:
-      - fit_debug.npz : raw X_r_cam / X_r_GS pointmaps, coverage, fit mask, fitted = C.X_r_cam,
-                        per-pixel residual, render confidence, true_shape, C=(s,R,t), det_R, rms,
-                        n_fit, degenerate, and the gate summary.
-      - dbg_render_fitted.ply : covered render pixels mapped to GS world by C (render-colored).
-      - dbg_render_gs.ply     : the GS points those covered pixels projected from (render-colored).
-    Overlay the two PLYs: if the fit is good they coincide; the offset is the fit error.
-    """
+def _save_debug(debug_dir, render_frame, X_r_cam, X_r_GS, X_comp, render_conf, cov, mask,
+                vmatch, true_shape, s, R, t_c, info, gate):
+    """Dump C-fit inputs/result + the completion pointmap/match for debugging. Never raises."""
     try:
         os.makedirs(debug_dir, exist_ok=True)
         fitted = (s * (X_r_cam @ np.asarray(R).T) + np.asarray(t_c).reshape(1, 3)).astype(np.float32)
@@ -63,6 +54,7 @@ def _save_debug(debug_dir, render_frame, X_r_cam, X_r_GS, render_conf, cov, mask
         np.savez(
             os.path.join(debug_dir, "fit_debug.npz"),
             X_r_cam=X_r_cam.astype(np.float32), X_r_GS=X_r_GS.astype(np.float32),
+            X_comp=np.asarray(X_comp, np.float32), vmatch=np.asarray(vmatch, bool),
             fitted=fitted, residual=resid, render_conf=render_conf,
             coverage=cov, mask=mask, true_shape=np.asarray(true_shape, np.int64),
             s=np.float64(s), R=np.asarray(R, np.float64), t=np.asarray(t_c, np.float64),
@@ -74,14 +66,13 @@ def _save_debug(debug_dir, render_frame, X_r_cam, X_r_GS, render_conf, cov, mask
         write_ply(os.path.join(debug_dir, "dbg_render_fitted.ply"), fitted[mask], col[mask])
         write_ply(os.path.join(debug_dir, "dbg_render_gs.ply"), X_r_GS[mask], col[mask])
         print(f"[novel_pos] debug: wrote {debug_dir}/ "
-              f"(fit_debug.npz + 2 overlay plys; residual median="
-              f"{np.nanmedian(resid):.4g})")
+              f"(fit_debug.npz + 2 overlay plys; residual median={np.nanmedian(resid):.4g})")
     except Exception as e:  # noqa: BLE001 (debug must never break the run)
         print(f"[novel_pos] WARNING: debug save failed: {e}")
 
 
 def run_pipeline(manifest_path, device="cuda:0", output_override=None, strict_gate=False,
-                 debug_dir=None) -> str:
+                 debug_dir=None, new_only=False) -> str:
     m = load_manifest(manifest_path)
 
     # (1) degrade GS -> world point cloud
@@ -101,7 +92,7 @@ def run_pipeline(manifest_path, device="cuda:0", output_override=None, strict_ga
     render_frame = build_frame(0, render_rgb, T_build, device=device)
     comp_frame = build_frame(1, comp_rgb, T_build, device=device)
 
-    # (4) resize transform + MASt3R grid (pure PIL/numpy; mast3r_utils already imported)
+    # (4) resize transform + MASt3R grid
     _, transform = resize_img(render_rgb, 512, return_transformation=True)
     true_shape = tuple(int(x) for x in render_frame.img_true_shape.view(-1).tolist())  # (H, W)
     rh, rw = render_rgb.shape[:2]
@@ -109,11 +100,15 @@ def run_pipeline(manifest_path, device="cuda:0", output_override=None, strict_ga
         print(f"[novel_pos] WARNING: intrinsics ({m.intrinsics.width}x{m.intrinsics.height}) "
               f"!= render_image ({rw}x{rh}); K_frame scale assumes render_image resolution.")
 
-    # (5) render mono inference ONCE (reused by the gate) -> X_r_cam
-    Xr, Cr = mast3r_inference_mono(model, render_frame)
-    render_frame.update_pointmap(Xr, Cr)
-    X_r_cam = Xr.detach().cpu().numpy()                      # (HW, 3)
-    render_conf = Cr.detach().cpu().numpy().reshape(-1)      # (HW,) geometric confidence
+    # (5) ONE asymmetric inference -> render + completion pointmaps, BOTH in the render frame
+    (idx, valid_match, X_render_t, C_render_t, Q_render_t,
+     X_comp_t, C_comp_t, Q_comp_t) = mast3r_match_asymmetric(model, render_frame, comp_frame)
+    X_r_cam = X_render_t.detach().cpu().numpy()                 # (HW,3) render grid, render frame
+    X_comp = X_comp_t.detach().cpu().numpy()                    # (HW,3) completion grid, render frame
+    C_comp = C_comp_t.reshape(-1).detach().cpu().numpy()        # (HW,)
+    vmatch = valid_match[0].reshape(-1).detach().cpu().numpy().astype(bool)  # (HW,) True=anchor
+    render_conf = C_render_t.reshape(-1).detach().cpu().numpy()
+    comp_uimg = comp_frame.uimg.detach().cpu().numpy()          # (H,W,3)
 
     # (6) project the degraded GS into the render view -> X_r_GS + coverage (GS world)
     R_c2w = gs_project.quat_wxyz_to_matrix(m.novel_pose.quaternion_wxyz)
@@ -137,22 +132,23 @@ def run_pipeline(manifest_path, device="cuda:0", output_override=None, strict_ga
           f"rms={info['rms']:.4g}{refl}"
           + ("  [WARN degenerate scale]" if info["degenerate"] else ""))
 
-    # (8) validation gate (report-only; render already inferred)
-    gate = run_validation_gate(model, render_frame, comp_frame, device, m.gate)
+    # (8) residual validation gate (report-only; both pointmaps already in render frame)
+    gate = residual_gate(X_r_cam, X_comp, vmatch, m.gate)
     _print_gate_report(gate)
     if debug_dir:
-        _save_debug(debug_dir, render_frame, X_r_cam, X_r_GS, render_conf, cov, mask,
-                    true_shape, s, R, t_c, info, gate)
+        _save_debug(debug_dir, render_frame, X_r_cam, X_r_GS, X_comp, render_conf, cov, mask,
+                    vmatch, true_shape, s, R, t_c, info, gate)
     if strict_gate and not gate.get("within_tolerance", False):
         raise RuntimeError(f"validation gate exceeded tolerance (strict mode): {gate}")
 
     # (9) apply C to the completion and append
     out_xyz, out_rgb, stats = update_point_cloud(
-        model, comp_frame, s, R, t_c, ex_xyz, ex_rgb,
-        conf_percentile=m.update_conf_percentile, device=device,
+        X_comp, C_comp, comp_uimg, vmatch, s, R, t_c, ex_xyz, ex_rgb,
+        conf_percentile=m.update_conf_percentile, new_only=new_only,
     )
     print(f"[novel_pos] update: +{stats['n_new']} new pts "
-          f"(s={stats['scale']:.4f}, det(R)={stats['det_R']:+.3f}), total={stats['n_total']}")
+          f"(new_only={stats['new_only']}, s={stats['scale']:.4f}, det(R)={stats['det_R']:+.3f}), "
+          f"total={stats['n_total']}")
 
     # (10) output merged point cloud
     out_path = output_override or m.output_ply

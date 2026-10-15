@@ -1,57 +1,57 @@
-"""Point-cloud update (ADR-001 修订2): place the AI completion into GS world via the
-fitted similarity transform C, then append to the degraded-GS cloud.
+"""Point-cloud update (ADR-001): place the AI completion into GS world via the fitted
+similarity transform C, then append to the degraded-GS cloud.
 
-C = (s, R, t) maps MASt3R camera frame -> GS world: ``X_GS = s * (x @ R.T) + t``
-(R may contain a reflection, det R = -1). C is fit in the pipeline from the render frame;
-here we only apply it. Single-shot, NO dedup in v1.
+Backend-free: numpy only. The completion pointmap, confidence and match validity are
+supplied by the pipeline from the single ``mast3r_match_asymmetric(render, completion)``
+call (completion expressed in the render frame) -- nothing is inferred here.
 
-WARNING: imports the CUDA backend (via mast3r_utils). GPU-only.
+Selection:
+  - default: a geometric-confidence percentile of the whole completion grid;
+  - ``new_only``: only pixels that FAILED to match the render (``vmatch == False``), i.e.
+    M_fill / genuinely new content (the GS has nothing there).
 """
 import numpy as np
-import torch
-
-from mast3r_slam.config import config
-from mast3r_slam.mast3r_utils import mast3r_inference_mono
 
 
-def update_point_cloud(model, completion_frame, C_s, C_R, C_t,
-                       existing_xyz, existing_rgb, conf_percentile: float = 50.0,
-                       device: str = "cuda:0"):
-    """Mono-infer the completion, apply C, confidence-filter, append.
+def update_point_cloud(X_comp, C_comp, uimg, vmatch, C_s, C_R, C_t,
+                       existing_xyz, existing_rgb, conf_percentile=50.0, new_only=False):
+    """Apply C to the completion pointmap (render frame -> GS world), select, append.
 
     Args:
-        C_s: float scale; C_R: (3,3) rotation (possibly reflected); C_t: (3,) translation.
+        X_comp: (HW,3) completion pointmap in the RENDER coordinate frame.
+        C_comp: (HW,) completion geometric confidence.
+        uimg:   (H,W,3) or (HW,3) completion RGB in [0,1], same grid as X_comp.
+        vmatch: (HW,) bool, True where the completion pixel matched the render (anchor).
+        C_s, C_R, C_t: similarity transform (s, R(3,3), t(3,)), MASt3R cam -> GS world.
     Returns (out_xyz (N,3) f32, out_rgb (N,3) u8, stats dict).
     """
-    assert config["dataset"]["img_downsample"] == 1, (
-        "novel_pos v1 requires dataset.img_downsample == 1 so uimg and the pointmap "
-        "share the same pixel grid for the confidence mask."
-    )
+    X_comp = np.asarray(X_comp, dtype=np.float64)
+    R = np.asarray(C_R, dtype=np.float64)
+    t = np.asarray(C_t, dtype=np.float64).reshape(1, 3)
+    Xw = float(C_s) * (X_comp @ R.T) + t                      # (HW,3) GS world
 
-    # completion pointmap in MASt3R camera frame (mono — same convention C was fit on)
-    Xc, Cc = mast3r_inference_mono(model, completion_frame)   # (HW,3), (HW,1)
+    C_comp = np.asarray(C_comp).reshape(-1)
+    vmatch = np.asarray(vmatch).reshape(-1).astype(bool)
+    finite = np.isfinite(Xw).all(1)
+    if new_only:
+        keep = (~vmatch) & finite                             # M_fill only
+    else:
+        c_fin = C_comp[finite]
+        thresh = np.quantile(c_fin, conf_percentile / 100.0) if c_fin.size else np.inf
+        keep = (C_comp >= thresh) & finite
 
-    R = torch.as_tensor(C_R, device=Xc.device, dtype=Xc.dtype)
-    t = torch.as_tensor(C_t, device=Xc.device, dtype=Xc.dtype).reshape(1, 3)
-    Xc_world = C_s * (Xc @ R.T) + t                          # X_GS = s (x R^T) + t
-
-    # confidence filter (percentile of this single-frame pointmap's confidence)
-    c = Cc.reshape(-1).float()
-    thresh = torch.quantile(c, conf_percentile / 100.0)
-    keep = c >= thresh
-    keep_np = keep.cpu().numpy()
-
-    new_xyz = Xc_world[keep].detach().cpu().numpy().astype(np.float32)
-    uimg = completion_frame.uimg.reshape(-1, 3).cpu().numpy()  # (HW,3) in [0,1], same grid
-    new_rgb = (uimg * 255.0).round().astype(np.uint8)[keep_np]
+    new_xyz = Xw[keep].astype(np.float32)
+    rgb = np.asarray(uimg).reshape(-1, 3)
+    new_rgb = (rgb * 255.0).round().astype(np.uint8)[keep]
 
     out_xyz = np.concatenate([np.asarray(existing_xyz, np.float32), new_xyz], axis=0)
     out_rgb = np.concatenate([np.asarray(existing_rgb, np.uint8), new_rgb], axis=0)
     stats = {
         "scale": float(C_s),
-        "det_R": float(np.linalg.det(np.asarray(C_R, dtype=np.float64))),
-        "n_new": int(keep_np.sum()),
+        "det_R": float(np.linalg.det(R)),
+        "n_new": int(keep.sum()),
         "n_existing": int(len(existing_xyz)),
         "n_total": int(len(out_xyz)),
+        "new_only": bool(new_only),
     }
     return out_xyz, out_rgb, stats

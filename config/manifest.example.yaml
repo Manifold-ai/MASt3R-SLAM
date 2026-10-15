@@ -31,7 +31,5 @@ gs_degrade:
   opacity_threshold: 0.5                 # post-sigmoid alpha threshold for degradation
 confidence:
   update_conf_percentile: 50             # keep completion points with conf above this percentile
-validation_gate:                         # report-only render<->completion deviation thresholds
-  max_rotation_deg: 5.0
-  max_translation_norm: 0.1
-  max_log_scale: 0.1
+validation_gate:                         # report-only: median render<->completion residual / scene depth
+  max_rel_residual: 0.05

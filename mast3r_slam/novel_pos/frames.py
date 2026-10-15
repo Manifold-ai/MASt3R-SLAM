@@ -1,4 +1,4 @@
-"""Frame construction + minimal keyframe stub for the standalone pose solve (ADR-001).
+"""Frame construction helpers for the novel-pos pipeline (ADR-001).
 
 WARNING: importing this module pulls in mast3r_slam.frame -> mast3r_slam.mast3r_utils
 -> mast3r_slam.matching -> `import mast3r_slam_backends` (the compiled CUDA extension).
@@ -8,29 +8,6 @@ import cv2
 import numpy as np
 
 from mast3r_slam.frame import create_frame, Frame
-
-
-class KeyframeStub:
-    """Minimal stand-in for SharedKeyframes that FrameTracker needs (single frame).
-
-    FrameTracker only calls last_keyframe()/__len__/__getitem__ (and, inside track(),
-    __setitem__, which the pose experiment never triggers).
-    """
-
-    def __init__(self, kf: Frame):
-        self._kf = kf
-
-    def last_keyframe(self) -> Frame:
-        return self._kf
-
-    def __len__(self) -> int:
-        return 1
-
-    def __getitem__(self, i) -> Frame:
-        return self._kf
-
-    def __setitem__(self, i, v) -> None:
-        self._kf = v
 
 
 def load_rgb01(path) -> np.ndarray:

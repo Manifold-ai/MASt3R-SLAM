@@ -34,9 +34,7 @@ class IntrinsicsSpec:               # pixel intrinsics for render_image original
 
 @dataclasses.dataclass
 class GateThresholds:
-    max_rotation_deg: float = 5.0
-    max_translation_norm: float = 0.1
-    max_log_scale: float = 0.1
+    max_rel_residual: float = 0.05   # median render<->completion residual / scene depth
 
 
 @dataclasses.dataclass
@@ -113,11 +111,7 @@ def load_manifest(path: str) -> Manifest:
     opacity_threshold = float((d.get("gs_degrade") or {}).get("opacity_threshold", 0.5))
     update_conf_percentile = float((d.get("confidence") or {}).get("update_conf_percentile", 50.0))
     g = d.get("validation_gate") or {}
-    gate = GateThresholds(
-        max_rotation_deg=float(g.get("max_rotation_deg", 5.0)),
-        max_translation_norm=float(g.get("max_translation_norm", 0.1)),
-        max_log_scale=float(g.get("max_log_scale", 0.1)),
-    )
+    gate = GateThresholds(max_rel_residual=float(g.get("max_rel_residual", 0.05)))
 
     for label, p in [
         ("gs_ply", gs_ply),
