@@ -79,6 +79,23 @@ def test_umeyama_guards():
     print("OK: umeyama guards (N<3, degenerate source)")
 
 
+def test_umeyama_weighted_downweights_outliers():
+    # 200 inliers follow y=s0·x+t0; 60 outliers map to garbage. Weighting the outliers near
+    # zero must recover the inlier transform, where the unweighted fit is pulled off.
+    rng = np.random.RandomState(7)
+    src_in = rng.randn(200, 3)
+    s0, R0, t0 = 2.0, np.eye(3), np.array([1.0, 0, 0])
+    tgt_in = s0 * (src_in @ R0.T) + t0
+    src_out, tgt_out = rng.randn(60, 3), rng.randn(60, 3) * 20
+    src = np.vstack([src_in, src_out])
+    tgt = np.vstack([tgt_in, tgt_out])
+    w = np.concatenate([np.ones(200), np.full(60, 1e-3)])
+    s, _, _, _ = align.umeyama_with_reflection(src, tgt, weights=w)
+    su, _, _, _ = align.umeyama_with_reflection(src, tgt)          # unweighted -> biased
+    assert abs(s - s0) < 0.05 and abs(s - s0) < abs(su - s0), (s, su)
+    print("OK: umeyama weighted down-weights outliers")
+
+
 # ------------------------------------------------------------------------- gs_project
 
 def test_quat_wxyz_to_matrix():
@@ -146,6 +163,7 @@ if __name__ == "__main__":
     test_umeyama_rotation_scale_translation()
     test_umeyama_known_reflection()
     test_umeyama_guards()
+    test_umeyama_weighted_downweights_outliers()
     test_quat_wxyz_to_matrix()
     test_project_gs_to_grid()
     test_residual_gate()

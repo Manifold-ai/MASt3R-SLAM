@@ -3,7 +3,7 @@
 Flow: load manifest -> degrade GS -> load model -> build render/completion frames (identity
 pose) -> ONE mast3r_match_asymmetric(render, completion) giving both pointmaps IN THE RENDER
 FRAME + the match -> project the GS into the render view (pose+K, z-buffer) -> fit similarity
-C (reflection allowed) X_r_GS ~= C.X_render -> residual validation gate (report-only) ->
+C (reflection allowed, render-confidence-weighted) X_r_GS ~= C.X_render -> residual gate ->
 apply C to the completion pointmap -> select (conf percentile, or new_only via valid_match)
 -> append -> write merged PLY.
 
@@ -44,18 +44,21 @@ def _print_gate_report(gate: dict) -> None:
 
 
 def _save_debug(debug_dir, render_frame, X_r_cam, X_r_GS, X_comp, render_conf, cov, mask,
-                vmatch, true_shape, s, R, t_c, info, gate):
+                vmatch, true_shape, s, R, t_c, info, gate, fit_weight="conf", fit_w=None):
     """Dump C-fit inputs/result + the completion pointmap/match for debugging. Never raises."""
     try:
         os.makedirs(debug_dir, exist_ok=True)
         fitted = (s * (X_r_cam @ np.asarray(R).T) + np.asarray(t_c).reshape(1, 3)).astype(np.float32)
         resid = np.full(X_r_cam.shape[0], np.nan, dtype=np.float32)
         resid[mask] = np.linalg.norm(fitted[mask] - X_r_GS[mask], axis=1)
+        fit_w_full = np.zeros(X_r_cam.shape[0], dtype=np.float32)   # per-pixel C-fit weight (0 off-mask)
+        fit_w_full[mask] = np.asarray(fit_w, np.float32) if fit_w is not None else 1.0
         np.savez(
             os.path.join(debug_dir, "fit_debug.npz"),
             X_r_cam=X_r_cam.astype(np.float32), X_r_GS=X_r_GS.astype(np.float32),
             X_comp=np.asarray(X_comp, np.float32), vmatch=np.asarray(vmatch, bool),
             fitted=fitted, residual=resid, render_conf=render_conf,
+            fit_weight=np.asarray(str(fit_weight)), fit_w=fit_w_full,
             coverage=cov, mask=mask, true_shape=np.asarray(true_shape, np.int64),
             s=np.float64(s), R=np.asarray(R, np.float64), t=np.asarray(t_c, np.float64),
             det_R=np.float64(info["det_R"]), rms=np.float64(info["rms"]),
@@ -72,7 +75,7 @@ def _save_debug(debug_dir, render_frame, X_r_cam, X_r_GS, X_comp, render_conf, c
 
 
 def run_pipeline(manifest_path, device="cuda:0", output_override=None, strict_gate=False,
-                 debug_dir=None, new_only=False) -> str:
+                 debug_dir=None, new_only=False, fit_weight="conf", fit_conf_percentile=0.0) -> str:
     m = load_manifest(manifest_path)
 
     # (1) degrade GS -> world point cloud
@@ -118,7 +121,7 @@ def run_pipeline(manifest_path, device="cuda:0", output_override=None, strict_ga
     X_r_GS, cov = gs_project.project_gs_to_grid(ex_xyz, R_c2w, t, K_frame, true_shape)
     print(f"[novel_pos] projected GS: coverage {int(cov.sum())}/{cov.size} pixels")
 
-    # (7) fit C (similarity WITH reflection) on covered, finite pixels
+    # (7) fit C (similarity WITH reflection) on covered, finite pixels, weighted by render conf
     mask = cov & np.isfinite(X_r_GS).all(1) & np.isfinite(X_r_cam).all(1)
     n_fit = int(mask.sum())
     if n_fit < MIN_FIT_PIXELS:
@@ -126,10 +129,27 @@ def run_pipeline(manifest_path, device="cuda:0", output_override=None, strict_ga
             f"fit C: too few covered pixels ({n_fit} < {MIN_FIT_PIXELS}); "
             f"check pose/intrinsics convention (wxyz/c2w/OpenCV) and GS density."
         )
-    s, R, t_c, info = align.umeyama_with_reflection(X_r_cam[mask], X_r_GS[mask])
+    if fit_weight == "conf":
+        # down-weight low-confidence correspondences: their MASt3R depth can disagree with the
+        # GS and bias the whole-view least-squares C. conf is positive; clip defensively.
+        fit_w = np.clip(render_conf[mask].astype(np.float64), 0.0, None)
+        if fit_conf_percentile > 0:                        # optional hard floor: drop lowest P%
+            thr = np.percentile(render_conf[mask], fit_conf_percentile)
+            fit_w = np.where(render_conf[mask] >= thr, fit_w, 0.0)
+        n_eff = int((fit_w > 0).sum())
+        if n_eff < MIN_FIT_PIXELS:
+            raise RuntimeError(
+                f"fit C: too few weighted pixels ({n_eff} < {MIN_FIT_PIXELS}) after conf floor "
+                f"{fit_conf_percentile:.0f}%; lower --fit-conf-percentile."
+            )
+    else:
+        fit_w, n_eff = None, n_fit
+    s, R, t_c, info = align.umeyama_with_reflection(X_r_cam[mask], X_r_GS[mask], weights=fit_w)
     refl = " (REFLECTION)" if info["det_R"] < 0 else ""
-    print(f"[novel_pos] fit C: N={n_fit} s={s:.4f} det(R)={info['det_R']:+.3f} "
-          f"rms={info['rms']:.4g}{refl}"
+    floor_note = (f", floor={fit_conf_percentile:.0f}%, n_eff={n_eff}"
+                  if fit_weight == "conf" and fit_conf_percentile > 0 else "")
+    print(f"[novel_pos] fit C: N={n_fit} (weight={fit_weight}{floor_note}) "
+          f"s={s:.4f} det(R)={info['det_R']:+.3f} rms={info['rms']:.4g}{refl}"
           + ("  [WARN degenerate scale]" if info["degenerate"] else ""))
 
     # (8) residual validation gate (report-only; both pointmaps already in render frame)
@@ -137,7 +157,7 @@ def run_pipeline(manifest_path, device="cuda:0", output_override=None, strict_ga
     _print_gate_report(gate)
     if debug_dir:
         _save_debug(debug_dir, render_frame, X_r_cam, X_r_GS, X_comp, render_conf, cov, mask,
-                    vmatch, true_shape, s, R, t_c, info, gate)
+                    vmatch, true_shape, s, R, t_c, info, gate, fit_weight, fit_w)
     if strict_gate and not gate.get("within_tolerance", False):
         raise RuntimeError(f"validation gate exceeded tolerance (strict mode): {gate}")
 

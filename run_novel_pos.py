@@ -36,6 +36,12 @@ def main():
                         help="only append completion pixels that failed to match the render "
                              "(valid_match == False, i.e. new/fill content) instead of a "
                              "confidence percentile of the whole completion")
+    parser.add_argument("--fit-weight", choices=["conf", "none"], default="conf",
+                        help="weight the C fit by render MASt3R confidence (default) or not; "
+                             "low-confidence correspondences otherwise bias the whole-view fit")
+    parser.add_argument("--fit-conf-percentile", type=float, default=0.0,
+                        help="optionally hard-drop the lowest P%% confidence correspondences "
+                             "before fitting C (0 = pure soft weighting; e.g. 50 = top-half only)")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -54,7 +60,8 @@ def main():
     from mast3r_slam.novel_pos.pipeline import run_pipeline
 
     run_pipeline(args.manifest, device=args.device, output_override=args.output,
-                 strict_gate=args.strict_gate, debug_dir=args.debug_dir, new_only=args.new_only)
+                 strict_gate=args.strict_gate, debug_dir=args.debug_dir, new_only=args.new_only,
+                 fit_weight=args.fit_weight, fit_conf_percentile=args.fit_conf_percentile)
 
 
 if __name__ == "__main__":
