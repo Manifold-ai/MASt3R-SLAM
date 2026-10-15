@@ -8,6 +8,8 @@ apply C to the completion -> append -> write merged PLY.
 
 WARNING: imports the CUDA backend (via the submodules below). GPU-only.
 """
+import os
+
 import numpy as np
 import lietorch
 
@@ -41,7 +43,45 @@ def _print_gate_report(dev: dict) -> None:
     print("=" * 60)
 
 
-def run_pipeline(manifest_path, device="cuda:0", output_override=None, strict_gate=False) -> str:
+def _save_debug(debug_dir, render_frame, X_r_cam, X_r_GS, render_conf, cov, mask,
+                true_shape, s, R, t_c, info, gate):
+    """Dump the C-fit inputs/result for debugging (never raises -- debug must not break the run).
+
+    Writes:
+      - fit_debug.npz : raw X_r_cam / X_r_GS pointmaps, coverage, fit mask, fitted = C.X_r_cam,
+                        per-pixel residual, render confidence, true_shape, C=(s,R,t), det_R, rms,
+                        n_fit, degenerate, and the gate summary.
+      - dbg_render_fitted.ply : covered render pixels mapped to GS world by C (render-colored).
+      - dbg_render_gs.ply     : the GS points those covered pixels projected from (render-colored).
+    Overlay the two PLYs: if the fit is good they coincide; the offset is the fit error.
+    """
+    try:
+        os.makedirs(debug_dir, exist_ok=True)
+        fitted = (s * (X_r_cam @ np.asarray(R).T) + np.asarray(t_c).reshape(1, 3)).astype(np.float32)
+        resid = np.full(X_r_cam.shape[0], np.nan, dtype=np.float32)
+        resid[mask] = np.linalg.norm(fitted[mask] - X_r_GS[mask], axis=1)
+        np.savez(
+            os.path.join(debug_dir, "fit_debug.npz"),
+            X_r_cam=X_r_cam.astype(np.float32), X_r_GS=X_r_GS.astype(np.float32),
+            fitted=fitted, residual=resid, render_conf=render_conf,
+            coverage=cov, mask=mask, true_shape=np.asarray(true_shape, np.int64),
+            s=np.float64(s), R=np.asarray(R, np.float64), t=np.asarray(t_c, np.float64),
+            det_R=np.float64(info["det_R"]), rms=np.float64(info["rms"]),
+            n_fit=np.int64(int(mask.sum())), degenerate=bool(info["degenerate"]),
+            gate=np.asarray(str(gate)),
+        )
+        col = (render_frame.uimg.reshape(-1, 3).cpu().numpy() * 255).round().astype(np.uint8)
+        write_ply(os.path.join(debug_dir, "dbg_render_fitted.ply"), fitted[mask], col[mask])
+        write_ply(os.path.join(debug_dir, "dbg_render_gs.ply"), X_r_GS[mask], col[mask])
+        print(f"[novel_pos] debug: wrote {debug_dir}/ "
+              f"(fit_debug.npz + 2 overlay plys; residual median="
+              f"{np.nanmedian(resid):.4g})")
+    except Exception as e:  # noqa: BLE001 (debug must never break the run)
+        print(f"[novel_pos] WARNING: debug save failed: {e}")
+
+
+def run_pipeline(manifest_path, device="cuda:0", output_override=None, strict_gate=False,
+                 debug_dir=None) -> str:
     m = load_manifest(manifest_path)
 
     # (1) degrade GS -> world point cloud
@@ -73,6 +113,7 @@ def run_pipeline(manifest_path, device="cuda:0", output_override=None, strict_ga
     Xr, Cr = mast3r_inference_mono(model, render_frame)
     render_frame.update_pointmap(Xr, Cr)
     X_r_cam = Xr.detach().cpu().numpy()                      # (HW, 3)
+    render_conf = Cr.detach().cpu().numpy().reshape(-1)      # (HW,) geometric confidence
 
     # (6) project the degraded GS into the render view -> X_r_GS + coverage (GS world)
     R_c2w = gs_project.quat_wxyz_to_matrix(m.novel_pose.quaternion_wxyz)
@@ -99,6 +140,9 @@ def run_pipeline(manifest_path, device="cuda:0", output_override=None, strict_ga
     # (8) validation gate (report-only; render already inferred)
     gate = run_validation_gate(model, render_frame, comp_frame, device, m.gate)
     _print_gate_report(gate)
+    if debug_dir:
+        _save_debug(debug_dir, render_frame, X_r_cam, X_r_GS, render_conf, cov, mask,
+                    true_shape, s, R, t_c, info, gate)
     if strict_gate and not gate.get("within_tolerance", False):
         raise RuntimeError(f"validation gate exceeded tolerance (strict mode): {gate}")
 

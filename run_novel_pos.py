@@ -29,6 +29,9 @@ def main():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--strict-gate", action="store_true",
                         help="abort if the render<->completion validation gate exceeds tolerance")
+    parser.add_argument("--debug-dir", default=None,
+                        help="if set, dump the C-fit pointmaps (X_r_cam/X_r_GS), coverage/mask, "
+                             "fit result + per-pixel residuals (fit_debug.npz) and two overlay PLYs")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -47,7 +50,7 @@ def main():
     from mast3r_slam.novel_pos.pipeline import run_pipeline
 
     run_pipeline(args.manifest, device=args.device, output_override=args.output,
-                 strict_gate=args.strict_gate)
+                 strict_gate=args.strict_gate, debug_dir=args.debug_dir)
 
 
 if __name__ == "__main__":
