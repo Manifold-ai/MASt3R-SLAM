@@ -45,6 +45,7 @@ class Manifest:
     novel_pose: PoseSpec            # camera-to-world, wxyz, OpenCV; used for projection
     intrinsics: IntrinsicsSpec      # used for projection (-> K_frame)
     output_ply: pathlib.Path
+    visibility_map: Optional[pathlib.Path] = None   # C-002: render alpha; checked when used
     panorama_image: Optional[pathlib.Path] = None
     panorama_pose: Optional[PoseSpec] = None
     opacity_threshold: float = 0.5
@@ -102,6 +103,11 @@ def load_manifest(path: str) -> Manifest:
     completion_image = _resolve(base, _req(nv, "completion_image", "novel_view."))
     novel_pose = _pose(_req(nv, "pose", "novel_view."), "novel_view.pose.")
     intrinsics = _intrinsics(_req(nv, "intrinsics", "novel_view."), "novel_view.intrinsics.")
+    # Optional. Existence is checked where the map is read (vis-mode != off), so a stale path
+    # with --vis-mode off still runs like a manifest without the field (C-002 §八). A present
+    # but empty value is kept (not treated as absent) so auto mode fails loudly on it.
+    vm = nv.get("visibility_map")
+    visibility_map = _resolve(base, vm) if vm is not None else None
     output_ply = _resolve(base, _req(d, "output_ply", ""))
 
     pano = d.get("panorama") or {}
@@ -130,6 +136,7 @@ def load_manifest(path: str) -> Manifest:
         novel_pose=novel_pose,
         intrinsics=intrinsics,
         output_ply=output_ply,
+        visibility_map=visibility_map,
         panorama_image=panorama_image,
         panorama_pose=panorama_pose,
         opacity_threshold=opacity_threshold,

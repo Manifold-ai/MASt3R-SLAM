@@ -7,6 +7,8 @@ gs_ply: scene.ply                        # existing Gaussian Splatting (.ply, 3D
 novel_view:
   render_image: nv_render.png            # REQUIRED: rendered-from-GS RGB (MASt3R mono input)
   completion_image: nv_ai.png            # REQUIRED: AI completion RGB
+  # visibility_map: nv_alpha.png         # OPTIONAL (C-002): 8-bit single-channel (grayscale) alpha
+  #                                      # PNG from the same render, 255=opaque 0=transparent, same WxH as render_image
 
   # REQUIRED — render camera, used to project the GS into the render view.
   # CONVENTION (contract §2): pose is camera-to-world, quaternion WXYZ, OpenCV axes (z forward).

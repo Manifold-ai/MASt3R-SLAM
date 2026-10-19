@@ -42,6 +42,14 @@ def main():
     parser.add_argument("--fit-conf-percentile", type=float, default=0.0,
                         help="optionally hard-drop the lowest P%% confidence correspondences "
                              "before fitting C (0 = pure soft weighting; e.g. 50 = top-half only)")
+    parser.add_argument("--vis-mode", choices=["auto", "off", "mask", "weight"], default="auto",
+                        help="render visibility map (C-002): auto = mask if the manifest has "
+                             "novel_view.visibility_map, else off; mask = fit C and gate anchors "
+                             "only on V = {alpha>=tau}; weight = fit C on all covered pixels with "
+                             "weights multiplied by alpha (no tau cut), gate anchors still on V")
+    parser.add_argument("--vis-threshold", type=float, default=0.5,
+                        help="tau in (0,1]: visible set V = {alpha >= tau}; 0.5 = gray >= 128. "
+                             "In weight mode tau only affects the gate anchors")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -61,7 +69,8 @@ def main():
 
     run_pipeline(args.manifest, device=args.device, output_override=args.output,
                  strict_gate=args.strict_gate, debug_dir=args.debug_dir, new_only=args.new_only,
-                 fit_weight=args.fit_weight, fit_conf_percentile=args.fit_conf_percentile)
+                 fit_weight=args.fit_weight, fit_conf_percentile=args.fit_conf_percentile,
+                 vis_mode=args.vis_mode, vis_threshold=args.vis_threshold)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ import tempfile
 
 import numpy as np
 
-from mast3r_slam.novel_pos import gs_io, align, gs_project
+from mast3r_slam.novel_pos import gs_io, align, gs_project, visibility
 from mast3r_slam.novel_pos.pose_experiment import residual_gate
 from mast3r_slam.novel_pos.pc_update import update_point_cloud
 from mast3r_slam.novel_pos.manifest import GateThresholds
@@ -137,6 +137,99 @@ def test_residual_gate():
     print("OK: residual_gate")
 
 
+def test_residual_gate_anchor_mask():
+    rng = np.random.RandomState(5)
+    X = rng.randn(400, 3) * 2 + np.array([0.0, 0.0, 5.0])
+    Xc = X.copy()
+    Xc[:200] += np.array([1.0, 0, 0])                         # first half moved by the completion
+    v = np.ones(400, bool)
+    v[200:250] = False                                        # unmatched inside V
+    Xc[260] = np.nan                                          # non-finite inside V
+    th = GateThresholds(max_rel_residual=0.05)
+    keep = np.arange(400) >= 200                              # V drops the moved half
+    g_all = residual_gate(X, Xc, v, th)
+    g_vis = residual_gate(X, Xc, v, th, anchor_mask=keep)
+    assert g_vis["ok"] and g_vis["median_residual"] < 1e-9 < g_all["median_residual"], (g_vis, g_all)
+    assert abs(g_vis["frac_anchor"] - 149 / 400) < 1e-12, g_vis   # V intersects, not replaces
+    assert residual_gate(X, Xc, v, th, anchor_mask=None) == g_all          # None == no mask
+    few = np.zeros(400, bool)
+    few[:50] = True
+    assert residual_gate(X, Xc, v, th, anchor_mask=few)["reason"] == "insufficient_anchor"
+    print("OK: residual_gate anchor_mask")
+
+
+# ----------------------------------------------------------------- visibility (C-002)
+
+def test_vis_mode_and_threshold():
+    assert visibility.resolve_vis_mode("auto", True) == "mask"
+    assert visibility.resolve_vis_mode("auto", False) == "off"
+    assert visibility.resolve_vis_mode("off", True) == "off"
+    assert visibility.resolve_vis_mode("weight", True) == "weight"
+    for mode, has_map in [("mask", False), ("weight", False), ("bogus", True)]:
+        try:
+            visibility.resolve_vis_mode(mode, has_map)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {mode}, has_map={has_map}")
+    assert visibility.check_threshold(1.0) == 1.0 and visibility.check_threshold(0.5) == 0.5
+    for tau in [0.0, 1.5, -0.1, float("nan")]:
+        try:
+            visibility.check_threshold(tau)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for tau={tau}")
+    print("OK: visibility mode + threshold")
+
+
+def test_vis_as_gray_u8():
+    g = (np.arange(12, dtype=np.uint8) * 20).reshape(3, 4)
+    assert np.array_equal(visibility.as_gray_u8(g, (3, 4)), g)
+    assert np.array_equal(visibility.as_gray_u8(np.dstack([g, g, g]), (3, 4)), g)
+    g2 = g.copy()
+    g2[0, 0] += 1
+    bad = [
+        np.dstack([g, g, g2]),                     # 3 channels that differ
+        np.dstack([g, g, g, g]),                   # 4 channels (RGBA)
+        g.astype(np.uint16),                       # 16-bit
+        g[:, :3],                                  # wrong size
+    ]
+    for img in bad:
+        try:
+            visibility.as_gray_u8(img, (3, 4))
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for shape {img.shape} dtype {img.dtype}")
+    print("OK: visibility as_gray_u8")
+
+
+def test_vis_alpha_roundtrip_and_threshold():
+    v = np.arange(256)
+    a = v.astype(np.uint8).astype(np.float32) / 255.0      # what frames.load_visibility_alpha feeds
+    assert np.array_equal(np.uint8(a * 255), v)              # resize_img entry: no truncation loss
+    V = visibility.visible_set(a, 0.5)
+    assert int(np.argmax(V)) == 128 and V[128:].all() and not V[:128].any(), np.argmax(V)
+    V1 = visibility.visible_set(a, 1.0)
+    assert V1.sum() == 1 and V1[255]                          # tau=1 -> only 255
+    print("OK: visibility alpha round-trip + threshold")
+
+
+def test_vis_fit_set_and_weights():
+    mask = np.array([True, True, True, False, True])
+    vis = np.array([True, False, True, True, False])
+    m2, n_drop = visibility.restrict_fit_mask(mask, vis, "mask")
+    assert np.array_equal(m2, [True, False, True, False, False]) and n_drop == 2, (m2, n_drop)
+    for mode in ("off", "weight"):
+        m3, n3 = visibility.restrict_fit_mask(mask, vis, mode)
+        assert m3 is mask and n3 == 0
+    alpha = np.array([1.0, 0.5, 0.0, 0.25])
+    w, kept = visibility.alpha_weights(None, alpha)          # --fit-weight none -> w = alpha
+    assert np.allclose(w, alpha) and abs(kept - 1.75 / 4) < 1e-12, (w, kept)
+    fw = np.array([2.0, 2.0, 4.0, 0.0])                       # conf weights (last floored to 0)
+    w, kept = visibility.alpha_weights(fw, alpha)
+    assert np.allclose(w, [2.0, 1.0, 0.0, 0.0]) and abs(kept - 3.0 / 8.0) < 1e-12, (w, kept)
+    print("OK: visibility fit set + alpha weights")
+
+
 # -------------------------------------------------------------- pc_update (apply C)
 
 def test_update_point_cloud():
@@ -168,4 +261,9 @@ if __name__ == "__main__":
     test_project_gs_to_grid()
     test_residual_gate()
     test_update_point_cloud()
+    test_residual_gate_anchor_mask()
+    test_vis_mode_and_threshold()
+    test_vis_as_gray_u8()
+    test_vis_alpha_roundtrip_and_threshold()
+    test_vis_fit_set_and_weights()
     print("smoke test done")
