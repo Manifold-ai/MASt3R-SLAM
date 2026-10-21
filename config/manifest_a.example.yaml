@@ -1,0 +1,34 @@
+# Example manifest for the ADR-002 A geometric merge (SLAM-C-003).
+# Run: python run_merge_a.py --manifest config/manifest_a.example.yaml
+# Paths are resolved relative to THIS file's directory unless absolute.
+
+gs_ply: scene.ply                        # P0: existing GS; degraded points define the world (T0 = I)
+
+keyframes:                               # one sealed local cloud per keyframe; ids must be unique
+  - id: F081
+    render_image: F081_render.png        # rendered from the GS at the known camera
+    completion_image: F081_ai.png        # AI completion of that render (same size)
+    # visibility_map: F081_alpha.png     # OPTIONAL (C-002 format): only alpha>=tau render pixels anchor to P0
+    pose:                                # camera-to-world, quaternion WXYZ, OpenCV axes (C-001 §二)
+      translation: [0.0, 0.0, 0.0]
+      quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
+    intrinsics: {width: 1024, height: 1024, fx: 800.0, fy: 800.0, cx: 512.0, cy: 512.0}
+  - id: F160
+    render_image: F160_render.png
+    completion_image: F160_ai.png
+    pose: {translation: [0.5, 0.0, 0.0], quaternion_wxyz: [0.9962, 0.0, 0.0872, 0.0]}
+    intrinsics: {width: 1024, height: 1024, fx: 800.0, fy: 800.0, cx: 512.0, cy: 512.0}
+
+# fixed_views:                           # OPTIONAL fixed observations (e.g. panorama cuts); never moved
+#   - id: cut_00
+#     image: cuts/cut_00.png             # must give the same MASt3R grid as the keyframes
+#     pose: {translation: [0.0, 0.0, 0.0], quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]}
+#     intrinsics: {width: 1024, height: 1024, fx: 512.0, fy: 512.0, cx: 512.0, cy: 512.0}
+
+output_dir: merge_a_out                  # merged.ply, transforms.json, report.json, assets/
+
+gs_degrade:
+  opacity_threshold: 0.5
+# geo:                                   # OPTIONAL solver/gate overrides (see geo_graph.GeoParams)
+#   sigma_anchor: 0.1
+#   min_anchor: 100
